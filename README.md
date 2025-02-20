@@ -1,6 +1,11 @@
 # sqlite3_odbc_vtabfunc
 SQLite3 virtual table and custom function access to ODBC data source
 
+Connect to the ODBC data source and execute the query to return result as the virtual table,execute update and delete with parameters.
+Virtual table with hide columns "odbccondition" and "odbcparameter1..odbcparameterN",the meaning and usage are as follows.
+
+Inspired by the *[Some troubles with ODBC (Win) virtual table](https://www.sqlite.org/forum/forumpost/b499e01e3aeccb89b8484d4ec399796cc8beea47695e54b20a679ccba73e5004)*
+
 # Usage
 ```SQL
 .load vtabodbc.dll sqlite3_odbc_init
