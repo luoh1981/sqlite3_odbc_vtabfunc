@@ -42,11 +42,7 @@ select odbc_execute(6859994838057138823,'update [AdventureWorks].[Person].[Perso
 +--------------------------------------------------------------+
 
 select odbc_execute(6859994838057138823,'update [AdventureWorks].[Person].[Person] SET Title=? WHERE rowguid=''92C4279F-1207-48A3-8448-4636514EB7E2''',NULL);
-+--------------------------------------------------------------+
-| odbc_execute(6859994838057138823,'update [AdventureWorks].[P |
-+--------------------------------------------------------------+
-| 1                                                            |
-+--------------------------------------------------------------+
+Runtime error: [Microsoft][ODBC SQL Server Driver]Invalid string or buffer length
 
 select odbc_disconnect(6859994838057138823);
 +--------------------------------------+
