@@ -126,21 +126,12 @@ static void* sqlite_OdbcErrorMsg(SQLHANDLE      hHandle,
 	free(emsg);
 	return pzErr;
 }
-static int odbcCreate(sqlite3* db, void* pAux, int argc, const char* const* argv, sqlite3_vtab** ppVtab, char** pzErr) {
+static TCHAR quotes[] = TEXT("\"'`[");
+static SQLHANDLE getConnection(struct clientDataHandles* pHandles, const char* const dsnStr, struct clientConnectionhandle** ppconH, char** pzErr)
+{
 	int rc = SQLITE_OK;
-	SQLHANDLE hEnv = NULL;
 	SQLHANDLE hConn = NULL;
 	struct clientConnectionhandle* pconH = NULL;
-	TCHAR* query = NULL;
-	SQLHANDLE hStmt = 0;
-	char* coltypes = NULL;
-	odbc_vtab* pTab;
-	TCHAR quotes[] = TEXT("\"'`[");
-	if (argc != 5) {
-		*pzErr = sqlite3_mprintf("odbc-module requires two argument: DSN and query to source");
-		goto CREATE_ERROR;
-	}
-	struct clientDataHandles* pHandles = (struct clientDataHandles*)pAux;
 	if (pHandles->hEnv == NULL) {
 		rc = SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &pHandles->hEnv);
 		if (rc != SQL_SUCCESS && rc != SQL_SUCCESS_WITH_INFO) {
@@ -159,14 +150,15 @@ static int odbcCreate(sqlite3* db, void* pAux, int argc, const char* const* argv
 	else {
 		pHandles->refcnt++;
 	}
-	hEnv = pHandles->hEnv;
-	int dsnlen = strlen(argv[3]);
-	char* s2 = &((argv[3])[1]);
+	int dsnlen = strlen(dsnStr);
+	
 	XXH64_hash_t DSNName = 0;
-	if (strchr("\"'`[", *s2))
+	if (strchr("\"'`[", *dsnStr)) {
+		char* s2 = &((dsnStr)[1]);
 		DSNName = XXH64(s2, dsnlen - 2, 0);
+	}
 	else
-		DSNName = XXH64(argv[3], dsnlen, 0);
+		DSNName = XXH64(dsnStr, dsnlen, 0);
 	HASH_FIND(hh, pHandles->cCh, &DSNName, sizeof(XXH64_hash_t), pconH);
 	if (!pconH) {
 		SQLHANDLE llhConn = NULL;
@@ -193,8 +185,8 @@ static int odbcCreate(sqlite3* db, void* pAux, int argc, const char* const* argv
 			llhConn = NULL;
 			goto CREATE_ERROR;
 		}
-		TCHAR* dsn = utf8to16(argv[3]);
-		if (!_tcschr(quotes, dsn)) {
+		TCHAR* dsn = utf8to16(dsnStr);
+		if (_tcschr(quotes, dsn[0])) {
 			dsn[0] = TEXT(' ');
 			dsn[_tcslen(dsn) - 1] = TEXT(' ');
 		}
@@ -221,9 +213,72 @@ static int odbcCreate(sqlite3* db, void* pAux, int argc, const char* const* argv
 		hConn = pconH->hConn;
 		pconH->refcnt += 1;
 	}
-
+	*ppconH = pconH;
+	return hConn;
+CREATE_ERROR:
+	if (pHandles->hEnv) {
+		pHandles->refcnt -= 1;
+		if (pHandles->refcnt == 0) {
+			SQLFreeHandle(SQL_HANDLE_ENV, pHandles->hEnv);
+			pHandles->hEnv = NULL;
+		}
+	}
+	if (hConn) {
+		if (!pconH) {
+			SQLFreeHandle(SQL_HANDLE_DBC, hConn);
+		}
+		else {
+			pconH->refcnt -= 1;
+			if (pconH->refcnt == 0) {
+				SQLFreeHandle(SQL_HANDLE_DBC, pconH->hConn);
+				pconH->hConn = NULL;
+				HASH_DEL(pHandles->cCh, pconH);
+				sqlite3_free(pconH);
+			}
+		}
+	}
+	return NULL;
+}
+static int FreeConnection(XXH64_hash_t DSNName, struct clientDataHandles* pHandles) {
+	if (pHandles) {
+		struct clientConnectionhandle* pconH;
+		HASH_FIND(hh, pHandles->cCh, &DSNName, sizeof(XXH64_hash_t), pconH);
+		if (pconH) {
+			pconH->refcnt -= 1;
+			if (pconH->refcnt == 0) {
+				SQLDisconnect(pconH);
+				SQLFreeHandle(SQL_HANDLE_DBC, pconH);
+				HASH_DEL(pHandles->cCh, pconH);
+				sqlite3_free(pconH);
+			}
+			pHandles->refcnt--;
+			if (pHandles->refcnt == 0) {
+				SQLFreeHandle(SQL_HANDLE_ENV, pHandles->hEnv);
+				pHandles->hEnv = NULL;
+			}
+			return 1;
+		}
+	}
+	return 0;
+}
+static int odbcCreate(sqlite3* db, void* pAux, int argc, const char* const* argv, sqlite3_vtab** ppVtab, char** pzErr) {
+	int rc = SQLITE_OK;
+	SQLHANDLE hConn = NULL;
+	struct clientConnectionhandle* pconH = NULL;
+	TCHAR* query = NULL;
+	SQLHANDLE hStmt = 0;
+	char* coltypes = NULL;
+	odbc_vtab* pTab;
+	if (argc != 5) {
+		*pzErr = sqlite3_mprintf("odbc-module requires two argument: DSN and query to source");
+		goto CREATE_ERROR;
+	}
+	struct clientDataHandles* pHandles = (struct clientDataHandles*) pAux;
+	hConn = getConnection(pHandles, argv[3],&pconH, pzErr);
+	if (hConn==NULL)
+		goto CREATE_ERROR;
 	query = utf8to16(argv[4]);
-	if (!_tcschr(quotes, query)) {
+	if (_tcschr(quotes, query[0])) {
 		query[0] = TEXT(' ');
 		query[_tcslen(query) - 1] = TEXT(' ');
 	}
@@ -367,7 +422,7 @@ static int odbcCreate(sqlite3* db, void* pAux, int argc, const char* const* argv
 		}
 		memset(pTab, 0, sizeof(*pTab));
 		pTab->query = query;
-		pTab->hEnv = hEnv;
+		pTab->hEnv = pHandles->hEnv;
 		pTab->hConn = hConn;
 		pTab->coltypes = coltypes;
 		pTab->colCount = colCount;
@@ -378,26 +433,8 @@ static int odbcCreate(sqlite3* db, void* pAux, int argc, const char* const* argv
 
 	}
 CREATE_ERROR:
-	if (hEnv) {
-		pHandles->refcnt -= 1;
-		if (pHandles->refcnt == 0) {
-			SQLFreeHandle(SQL_HANDLE_ENV, pHandles->hEnv);
-			pHandles->hEnv = NULL;
-		}
-	}
-	if (hConn) {
-		if (!pconH) {
-			SQLFreeHandle(SQL_HANDLE_DBC, hConn);
-		}
-		else {
-			pconH->refcnt -= 1;
-			if (pconH->refcnt == 0) {
-				SQLFreeHandle(SQL_HANDLE_DBC, pconH->hConn);
-				pconH->hConn = NULL;
-				HASH_DEL(pHandles->cCh, pconH);
-				sqlite3_free(pconH);
-			}
-		}
+	if (hConn && pconH) {
+		FreeConnection(pconH->DSNName, pHandles);
 	}
 	if (hStmt) {
 		SQLFreeHandle(SQL_HANDLE_STMT, hStmt);
@@ -674,114 +711,6 @@ static sqlite3_module odbcModule = {
 	/* xShadowName */ 0
 };
 
-static int GetSQLHandle(sqlite3_context* context, struct clientDataHandles* pHandles, const void* pConnStr) {
-	int rc = SQLITE_OK;
-	SQLHANDLE hEnv = NULL;
-	SQLHANDLE hConn = NULL;
-	struct clientConnectionhandle* pconH;
-	if (pHandles->hEnv == NULL) {
-		rc = SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &pHandles->hEnv);
-		if (rc != SQL_SUCCESS && rc != SQL_SUCCESS_WITH_INFO) {
-			const char* e = "Can't get access to ODBC";
-			int elen = strlen(e);
-			sqlite3_result_error(context, e, elen);
-			pHandles->hEnv = NULL;
-			goto CREATE_ERROR;
-		}
-		rc = SQLSetEnvAttr(pHandles->hEnv, SQL_ATTR_ODBC_VERSION, (SQLPOINTER)SQL_OV_ODBC3, 0);
-		if (rc != SQL_SUCCESS && rc != SQL_SUCCESS_WITH_INFO) {
-			const char* e = sqlite_OdbcErrorMsg(pHandles->hEnv, SQL_HANDLE_ENV, rc);
-			sqlite3_result_error(context, e, strlen(e));
-			SQLFreeHandle(SQL_HANDLE_ENV, pHandles->hEnv);
-			pHandles->hEnv = NULL;
-			goto CREATE_ERROR;
-		}
-		pHandles->refcnt++;
-	}
-	else {
-		pHandles->refcnt++;
-	}
-	hEnv = pHandles->hEnv;
-	XXH64_hash_t DSNName = XXH64(pConnStr, strlen(pConnStr), 0);
-	HASH_FIND(hh, pHandles->cCh, &DSNName, sizeof(XXH64_hash_t), pconH);
-	if (!pconH) {
-		SQLHANDLE llhConn = NULL;
-		rc = SQLAllocHandle(SQL_HANDLE_DBC, pHandles->hEnv, &llhConn);
-		if (rc != SQL_SUCCESS && rc != SQL_SUCCESS_WITH_INFO) {
-			const char* e = sqlite_OdbcErrorMsg(pHandles->hEnv, SQL_HANDLE_ENV, rc);
-			sqlite3_result_error(context, e, strlen(e));
-			goto CREATE_ERROR;
-		}
-#define ODBCCHECKCATTRRC(rc) if (rc != SQL_SUCCESS && rc != SQL_SUCCESS_WITH_INFO) goto ENDSETATTR;
-		rc = SQLSetConnectAttr(llhConn, SQL_ATTR_CONNECTION_TIMEOUT, (SQLPOINTER)5, 0);
-		ODBCCHECKCATTRRC(rc)
-			rc = SQLSetConnectAttr(llhConn, SQL_ATTR_LOGIN_TIMEOUT, (SQLPOINTER)5, 0);
-		ODBCCHECKCATTRRC(rc)
-			rc = SQLSetConnectAttr(llhConn, SQL_ATTR_ACCESS_MODE, (SQLPOINTER)SQL_MODE_READ_WRITE, 0);
-		ODBCCHECKCATTRRC(rc)
-			rc = SQLSetConnectAttr(llhConn, SQL_ATTR_TXN_ISOLATION, (SQLPOINTER)SQL_TXN_READ_COMMITTED, 0);
-		ODBCCHECKCATTRRC(rc)
-			rc = SQLSetConnectAttr(llhConn, SQL_ATTR_AUTOCOMMIT, (SQLPOINTER)TRUE, 0);
-#undef ODBCCHECKCATTRRC
-		ENDSETATTR :
-		if (rc != SQL_SUCCESS && rc != SQL_SUCCESS_WITH_INFO) {
-			const char* e = sqlite_OdbcErrorMsg(llhConn, SQL_HANDLE_DBC, rc);
-			sqlite3_result_error(context, e, strlen(e));
-			SQLFreeHandle(SQL_HANDLE_DBC, llhConn);
-			llhConn = NULL;
-			goto CREATE_ERROR;
-		}
-		TCHAR* dsn = utf8to16(pConnStr);
-		rc = SQLDriverConnect(llhConn, NULL, dsn, _tcslen(dsn), SQL_NTS, 0, NULL, SQL_DRIVER_NOPROMPT);
-		free(dsn);
-		if (rc != SQL_SUCCESS && rc != SQL_SUCCESS_WITH_INFO) {
-			const char* e = sqlite_OdbcErrorMsg(llhConn, SQL_HANDLE_DBC, rc);
-			sqlite3_result_error(context, e, strlen(e));
-			SQLFreeHandle(SQL_HANDLE_DBC, llhConn);
-			goto CREATE_ERROR;
-		}
-		hConn = llhConn;
-		pconH = (struct clientConnectionhandle*)sqlite3_malloc(sizeof(struct clientConnectionhandle));
-		if (!pconH) {
-			sqlite3_result_error(context, "sqlite3_malloc failure.", sizeof("sqlite3_malloc failure."));
-			goto CREATE_ERROR;
-		}
-		memset(pconH, 0, sizeof(struct clientConnectionhandle));
-		pconH->DSNName = DSNName;
-		pconH->hConn = hConn;
-		pconH->refcnt += 1;
-		HASH_ADD(hh, pHandles->cCh, DSNName, sizeof(XXH64_hash_t), pconH);
-	}
-	else {
-		hConn = pconH->hConn;
-		pconH->refcnt += 1;
-	}
-	sqlite3_result_int64(context, DSNName);
-	return SQLITE_OK;
-CREATE_ERROR:
-	if (hEnv) {
-		pHandles->refcnt -= 1;
-		if (pHandles->refcnt == 0) {
-			SQLFreeHandle(SQL_HANDLE_ENV, pHandles->hEnv);
-			pHandles->hEnv = NULL;
-		}
-	}
-	if (hConn) {
-		if (!pconH) {
-			SQLFreeHandle(SQL_HANDLE_DBC, hConn);
-		}
-		else {
-			pconH->refcnt -= 1;
-			if (pconH->refcnt == 0) {
-				SQLFreeHandle(SQL_HANDLE_DBC, pconH->hConn);
-				pconH->hConn = NULL;
-				HASH_DEL(pHandles->cCh, pconH);
-				sqlite3_free(pconH);
-			}
-		}
-	}
-	return SQLITE_ERROR;
-}
 static void sqlite3_OdbcConnect(sqlite3_context* context, int argc, sqlite3_value** argv) {
 	assert(argc == 1);
 	if (sqlite3_value_type(argv[0]) == SQLITE_NULL) {
@@ -790,7 +719,21 @@ static void sqlite3_OdbcConnect(sqlite3_context* context, int argc, sqlite3_valu
 	}
 	const char* pConnStr = sqlite3_value_text(argv[0]);
 	struct clientDataHandles* pHandles = (struct clientDataHandles*)sqlite3_user_data(context);
-	return GetSQLHandle(context, pHandles, pConnStr);
+	SQLHANDLE hConn = NULL;
+	struct clientConnectionhandle* pconH;
+	char* pzErr = NULL;
+	hConn = getConnection(pHandles, pConnStr, &pconH, &pzErr);
+	if (hConn) {
+		sqlite3_result_int64(context, pconH->DSNName);
+		return SQLITE_OK;
+	}
+	else {
+		if (pzErr)
+		{
+			sqlite3_result_error(context, pzErr, strlen(pzErr));
+			sqlite3_free(pzErr);
+		}
+	}
 }
 static void sqlite3_OdbcDisconnect(sqlite3_context* context, int argc, sqlite3_value** argv) {
 	assert(argc == 1);
@@ -801,25 +744,10 @@ static void sqlite3_OdbcDisconnect(sqlite3_context* context, int argc, sqlite3_v
 	XXH64_hash_t DSNName = sqlite3_value_int64(argv[0]);
 	struct clientDataHandles* pHandles = sqlite3_user_data(context);
 	if (pHandles) {
-		struct clientConnectionhandle* pconH;
-		HASH_FIND(hh, pHandles->cCh, &DSNName, sizeof(XXH64_hash_t), pconH);
-		if (pconH) {
-			pconH->refcnt -= 1;
-			if (pconH->refcnt == 0) {
-				SQLDisconnect(pconH);
-				SQLFreeHandle(SQL_HANDLE_DBC, pconH);
-				HASH_DEL(pHandles->cCh, pconH);
-				sqlite3_free(pconH);
-			}
-			pHandles->refcnt--;
-			if (pHandles->refcnt == 0) {
-				SQLFreeHandle(SQL_HANDLE_ENV, pHandles->hEnv);
-				pHandles->hEnv = NULL;
-			}
+		if (FreeConnection(DSNName, pHandles)) {
 			sqlite3_result_int(context, 1);
 		}
 	}
-	return SQLITE_OK;
 }
 static void sqlite3_OdbcExec(sqlite3_context* context, int argc, sqlite3_value** argv) {
 	int rc = SQLITE_OK;
@@ -858,8 +786,7 @@ static void sqlite3_OdbcExec(sqlite3_context* context, int argc, sqlite3_value**
 					break;
 				}
 				case SQLITE_FLOAT:
-				{
-					double dv = sqlite3_value_double(argv[argcidx]);
+				{   double dv = sqlite3_value_double(argv[argcidx]);
 					rc = SQLBindParameter(hStmt, col, SQL_PARAM_INPUT, SQL_C_DOUBLE, SQL_DOUBLE, 8, 0, &dv, sizeof(double), NULL);
 					break;
 				}
@@ -902,6 +829,7 @@ EERROR:
 		else {
 			const char* e = sqlite_OdbcErrorMsg(hStmt, SQL_HANDLE_STMT, rc);
 			sqlite3_result_error(context, e, strlen(e));
+			sqlite3_free(e);
 		}
 		SQLFreeHandle(SQL_HANDLE_STMT, hStmt);
 	}
@@ -916,8 +844,8 @@ int sqlite3_odbc_init(sqlite3* db, char** pzErrMsg, const sqlite3_api_routines* 
 	struct clientDataHandles* pH = sqlite3_malloc(sizeof(struct clientDataHandles));
 	memset(pH, 0, sizeof(struct clientDataHandles));
 	rc = sqlite3_create_module_v2(db, "odbc", &odbcModule, pH, sqlite3_free);
-	rc = sqlite3_create_function_v2(db, "odbc_connect", -1, SQLITE_UTF8, pH, sqlite3_OdbcConnect, NULL, NULL, NULL);
-	rc = sqlite3_create_function_v2(db, "odbc_disconnect", -1, SQLITE_UTF8, pH, sqlite3_OdbcDisconnect, NULL, NULL, NULL);
+	rc = sqlite3_create_function_v2(db, "odbc_connect", 1, SQLITE_UTF8, pH, sqlite3_OdbcConnect,NULL, NULL, NULL);
+	rc = sqlite3_create_function_v2(db, "odbc_disconnect", 1, SQLITE_UTF8, pH, sqlite3_OdbcDisconnect, NULL, NULL, NULL);
 	rc = sqlite3_create_function_v2(db, "odbc_execute", -1, SQLITE_UTF8, pH, sqlite3_OdbcExec, NULL, NULL, NULL);
 	return rc;
 }
